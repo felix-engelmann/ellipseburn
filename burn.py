@@ -22,12 +22,13 @@ def hello_world():
         paths, attributes, svg_attributes = dom2paths(doc)
         
         laser=np.array([[ float(request.form["laserx"]), 0],[ 0, float(request.form["lasery"]) ]])
+        inv = "invert" in request.form
         
         outlines = []
         for p in paths:
             if p.iscontinuous():
                 if p.isclosed():
-                    outlines.append(trace(p, laser))
+                    outlines.append(trace(p, laser, hole=True ^ inv))
             else:
                 subs = p.continuous_subpaths()
                 for sub in subs:
@@ -35,7 +36,7 @@ def hello_world():
                         hole=False
                         if any([sub.is_contained_by(a) for a in subs if a!=sub]):
                             hole=True
-                        outlines.append(trace(sub, laser,hole=hole))
+                        outlines.append(trace(sub, laser,hole=hole ^ inv))
                     else:
                         outlines.append(p)
         
