@@ -1,7 +1,7 @@
 from flask import Flask, request, render_template
 
 from svgpathtools.parser import parse_path
-from svgpathtools import Path, Line, CubicBezier
+from svgpathtools import Path, Line, CubicBezier, concatpaths, path_encloses_pt, Arc
 from svgpathtools import paths2Drawing
 from xml.dom.minidom import parse
 
@@ -13,6 +13,48 @@ from io import StringIO, BytesIO
 
 app = Flask(__name__)
 
+def unifypoints(paths, mdist):
+    points = {}
+    for pid,path in enumerate(paths):
+        for s in ["start","end"]:
+            for point in points.keys():
+                if point != getattr(path,s) and abs(point-getattr(path,s)) <  mdist:
+                    setattr(paths[pid],s,point)
+                    #print("unified")
+                    points[getattr(path, s)].append(pid)
+                    break
+            else:
+                points[getattr(path,s)] = [pid]
+    return paths
+
+def joinpaths(paths):
+    np = []
+    consumed = set()
+    foundany = False
+    for pi, path in enumerate(paths):
+        if pi in consumed:
+            continue
+        foundcon = False
+        for ci,conn in enumerate(paths):
+            if ci <= pi or ci in consumed:
+                continue
+            for dp in [path, path.reversed()]:
+                for dc in [conn, conn.reversed()]:
+                    if dp.end == dc.start:
+                        np.append(concatpaths([dp,dc]))
+                        consumed.add(ci)
+                        foundcon = True
+                        break
+            else:
+                break
+        if foundcon:
+            foundany = True
+        else:
+            np.append(path)
+    if foundany:
+        return joinpaths(np)
+    return np
+
 @app.route("/", methods=['GET', 'POST'])
 def hello_world():
     if request.method == 'POST':
@@ -23,12 +65,20 @@ def hello_world():
         
         laser=np.array([[ float(request.form["laserx"]), 0],[ 0, float(request.form["lasery"]) ]])
         inv = "invert" in request.form
-        
+
+        mdist = float(request.form.get("mdistance", 1e-03))
+
+        paths = unifypoints(paths, mdist)
+        paths = joinpaths(paths)
+
         outlines = []
         for p in paths:
             if p.iscontinuous():
                 if p.isclosed():
-                    outlines.append(trace(p, laser, hole=True ^ inv))
+                    hole = False
+                    if any([p.is_contained_by(a) for a in paths if a != p and a.isclosed()]):
+                        hole = True
+                    outlines.append(trace(p, laser, hole=hole ^ inv))
             else:
                 subs = p.continuous_subpaths()
                 for sub in subs:
@@ -39,8 +89,10 @@ def hello_world():
                         outlines.append(trace(sub, laser,hole=hole ^ inv))
                     else:
                         outlines.append(p)
+
+        outlines = list(filter(lambda x: len(x) > 0, outlines))
         
-        stroke = float(attributes[0]["stroke-width"])
+        stroke = float(attributes[0].get("stroke-width",0.0899589))
         if "original" in request.form:
             svg = paths2Drawing(paths+outlines, "k"*len(paths)+"g"*len(outlines), svg_attributes = svg_attributes, stroke_widths=[stroke]*(len(paths)+len(outlines)))
         else:
@@ -191,9 +243,26 @@ def fix_corner(old, new):
 
 def trace(zerop, laser, hole=False):
     tp=Path()
+    first = zerop[0]
+    wrong = path_encloses_pt(first.point(0.5)+(first.normal(0.5)*0.01), -100000+100000j, zerop)
+    if wrong:
+        hole = not hole
     for li in zerop:
         #print(li)
-        if type(li)==CubicBezier:
+        if type(li) == Arc:
+            parts = 20
+            for i in range(parts):
+                partli = Line(li.point(i/parts),li.point((i+1)/parts))
+                shift = scale_normal(partli.normal(), laser, hole)
+                cut = partli.translated(-shift)
+                if len(tp) == 0:
+                    tp.append(cut)
+                else:
+                    ps = fix_corner(tp[-1], cut)
+                    tp[-1] = ps[0]
+                    tp += ps[1:]
+
+        elif type(li)==CubicBezier:
             shift = scale_normal(li.normal(1), laser, hole)
             ends = li.translated(-shift)
             shift = scale_normal(li.normal(0), laser, hole)
@@ -230,8 +299,11 @@ def trace(zerop, laser, hole=False):
                 ps = fix_corner(tp[-1],cut)
                 tp[-1] = ps[0]
                 tp+=ps[1:]
-    ps = fix_corner(tp[-1],tp[0])
-    tp[-1] = ps[0]
-    tp+=ps[1:-1]
-    tp[0] = ps[-1]
+        else:
+            print("unknown type", type(li))
+    if len(tp) > 0:
+        ps = fix_corner(tp[-1],tp[0])
+        tp[-1] = ps[0]
+        tp+=ps[1:-1]
+        tp[0] = ps[-1]
     return tp
