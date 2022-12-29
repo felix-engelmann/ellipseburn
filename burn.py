@@ -45,7 +45,9 @@ def joinpaths(paths):
                         consumed.add(ci)
                         foundcon = True
                         break
-            else:
+                if foundcon:
+                    break
+            if foundcon:
                 break
         if foundcon:
             foundany = True
