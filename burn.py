@@ -5,6 +5,7 @@ from svgpathtools import Path, Line, CubicBezier, concatpaths, path_encloses_pt,
 from svgpathtools import paths2Drawing
 from xml.dom.minidom import parse
 
+import re
 import numpy as np
 
 from flask import send_file
@@ -12,6 +13,125 @@ from flask import send_file
 from io import StringIO, BytesIO
 
 app = Flask(__name__)
+
+
+
+COORD_PAIR_TMPLT = re.compile(
+    r'([\+-]?\d*[\.\d]\d*[eE][\+-]?\d+|[\+-]?\d*[\.\d]\d*)' +
+    r'(?:\s*,\s*|\s+|(?=-))' +
+    r'([\+-]?\d*[\.\d]\d*[eE][\+-]?\d+|[\+-]?\d*[\.\d]\d*)'
+)
+
+
+def path2pathd(path):
+    return path.get('d', '')
+
+
+def ellipse2pathd(ellipse):
+    """converts the parameters from an ellipse or a circle to a string for a 
+    Path object d-attribute"""
+
+    cx = ellipse.get('cx', 0)
+    cy = ellipse.get('cy', 0)
+    rx = ellipse.get('rx', None)
+    ry = ellipse.get('ry', None)
+    r = ellipse.get('r', None)
+
+    if r is not None:
+        rx = ry = float(r)
+    else:
+        rx = float(rx)
+        ry = float(ry)
+
+    cx = float(cx)
+    cy = float(cy)
+
+    d = ''
+    d += 'M' + str(cx - rx) + ',' + str(cy)
+    d += 'a' + str(rx) + ',' + str(ry) + ' 0 1,0 ' + str(2 * rx) + ',0'
+    d += 'a' + str(rx) + ',' + str(ry) + ' 0 1,0 ' + str(-2 * rx) + ',0'
+
+    return d + 'z'
+
+
+def polyline2pathd(polyline, is_polygon=False):
+    """converts the string from a polyline points-attribute to a string for a
+    Path object d-attribute"""
+    if isinstance(polyline, str):
+        points = polyline
+    else:
+        points = COORD_PAIR_TMPLT.findall(polyline.get('points', ''))
+
+    closed = (float(points[0][0]) == float(points[-1][0]) and
+              float(points[0][1]) == float(points[-1][1]))
+
+    # The `parse_path` call ignores redundant 'z' (closure) commands
+    # e.g. `parse_path('M0 0L100 100Z') == parse_path('M0 0L100 100L0 0Z')`
+    # This check ensures that an n-point polygon is converted to an n-Line path.
+    if is_polygon and closed:
+        points.append(points[0])
+
+    d = 'M' + 'L'.join('{0} {1}'.format(x,y) for x,y in points)
+    if is_polygon or closed:
+        d += 'z'
+    return d
+
+
+def polygon2pathd(polyline):
+    """converts the string from a polygon points-attribute to a string 
+    for a Path object d-attribute.
+    Note:  For a polygon made from n points, the resulting path will be
+    composed of n lines (even if some of these lines have length zero).
+    """
+    return polyline2pathd(polyline, True)
+
+
+def rect2pathd(rect):
+    """Converts an SVG-rect element to a Path d-string.
+    
+    The rectangle will start at the (x,y) coordinate specified by the 
+    rectangle object and proceed counter-clockwise."""
+    x, y = float(rect.get('x', 0)), float(rect.get('y', 0))
+    w, h = float(rect.get('width', 0)), float(rect.get('height', 0))
+    if 'rx' in rect or 'ry' in rect:
+
+        # if only one, rx or ry, is present, use that value for both
+        # https://developer.mozilla.org/en-US/docs/Web/SVG/Element/rect
+        rx = rect.get('rx', None)
+        ry = rect.get('ry', None)
+        if rx is None:
+            rx = ry or 0.
+        if ry is None:
+            ry = rx or 0.
+        rx, ry = float(rx), float(ry)
+
+        d = "M {} {} ".format(x + rx, y)  # right of p0
+        d += "L {} {} ".format(x + w - rx, y)  # go to p1
+        d += "A {} {} 0 0 1 {} {} ".format(rx, ry, x+w, y+ry)  # arc for p1
+        d += "L {} {} ".format(x+w, y+h-ry)  # above p2
+        d += "A {} {} 0 0 1 {} {} ".format(rx, ry, x+w-rx, y+h)  # arc for p2
+        d += "L {} {} ".format(x+rx, y+h)  # right of p3
+        d += "A {} {} 0 0 1 {} {} ".format(rx, ry, x, y+h-ry)  # arc for p3
+        d += "L {} {} ".format(x, y+ry)  # below p0
+        d += "A {} {} 0 0 1 {} {} z".format(rx, ry, x+rx, y)  # arc for p0
+        return d
+
+    x0, y0 = x, y
+    x1, y1 = x + w, y
+    x2, y2 = x + w, y + h
+    x3, y3 = x, y + h
+
+    d = ("M{} {} L {} {} L {} {} L {} {} z"
+         "".format(x0, y0, x1, y1, x2, y2, x3, y3))
+        
+    return d
+
+
+def line2pathd(l):
+    return (
+        'M' + l.attrib.get('x1', '0') + ' ' + l.attrib.get('y1', '0')
+        + 'L' + l.attrib.get('x2', '0') + ' ' + l.attrib.get('y2', '0')
+    )
 
 def unifypoints(paths, mdist):
     points = {}
@@ -64,33 +184,43 @@ def hello_world():
         print(f)
         doc = parse(f)
         paths, attributes, svg_attributes = dom2paths(doc)
-        
-        laser=np.array([[ float(request.form["laserx"]), 0],[ 0, float(request.form["lasery"]) ]])
+
+        try:
+            laser=np.array([[ float(request.form.get("laserx",0.0)), 0],[ 0, float(request.form.get("lasery",0.0)) ]])
+        except:
+            laser = np.array([[1, 0], [0, 1]])
         inv = "invert" in request.form
 
         mdist = float(request.form.get("mdistance", 1e-03))
 
+        arcsegn = int(request.form.get("arcsegments", 50))
+
         paths = unifypoints(paths, mdist)
+        print("unified points")
         paths = joinpaths(paths)
+        print("joined paths")
+
 
         outlines = []
-        for p in paths:
-            if p.iscontinuous():
-                if p.isclosed():
-                    hole = False
-                    if any([p.is_contained_by(a) for a in paths if a != p and a.isclosed()]):
-                        hole = True
-                    outlines.append(trace(p, laser, hole=hole ^ inv))
-            else:
-                subs = p.continuous_subpaths()
-                for sub in subs:
-                    if sub.isclosed():
-                        hole=False
-                        if any([sub.is_contained_by(a) for a in subs if a!=sub]):
-                            hole=True
-                        outlines.append(trace(sub, laser,hole=hole ^ inv))
-                    else:
-                        outlines.append(p)
+        if "join" not in request.form:
+            for nthp,p in enumerate(paths):
+                if p.iscontinuous():
+                    if p.isclosed():
+                        hole = False
+                        if any([p.is_contained_by(a) for a in paths if a != p and a.isclosed()]):
+                            hole = True
+                        outlines.append(trace(p, laser, hole=hole ^ inv, arcsegn=arcsegn))
+                else:
+                    subs = p.continuous_subpaths()
+                    for sub in subs:
+                        if sub.isclosed():
+                            hole=False
+                            if any([sub.is_contained_by(a) for a in subs if a!=sub]):
+                                hole=True
+                            outlines.append(trace(sub, laser,hole=hole ^ inv, arcsegn=arcsegn))
+                        else:
+                            outlines.append(p)
+                print("outlined", nthp, "/", len(paths))
 
         outlines = list(filter(lambda x: len(x) > 0, outlines))
         
@@ -243,7 +373,7 @@ def fix_corner(old, new):
         ps.append(stay)
     return ps
 
-def trace(zerop, laser, hole=False):
+def trace(zerop, laser, hole=False, arcsegn=50):
     tp=Path()
     first = zerop[0]
     wrong = path_encloses_pt(first.point(0.5)+(first.normal(0.5)*0.01), -100000+100000j, zerop)
@@ -252,7 +382,7 @@ def trace(zerop, laser, hole=False):
     for li in zerop:
         #print(li)
         if type(li) == Arc:
-            parts = 20
+            parts = arcsegn
             for i in range(parts):
                 partli = Line(li.point(i/parts),li.point((i+1)/parts))
                 shift = scale_normal(partli.normal(), laser, hole)
